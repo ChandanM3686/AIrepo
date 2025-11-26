@@ -1,4 +1,4 @@
-# s.py - Streamlit version of app.py
+# s.py - Streamlit version of app.py (updated to prefer 4 recommendations & progressive relaxation)
 import streamlit as st
 import requests
 import os
@@ -16,12 +16,15 @@ except ImportError:
 # === Put your SerpAPI key here or set as environment variable SERPAPI_KEY ===
 SERPAPI_KEY = os.getenv("SERPAPI_KEY") or "a3c301766fd3f33d0f8b2c76c10d2beccd3ccdfbad2b31f5b80d0a50f3f48b7c"
 SERPAPI_URL = "https://serpapi.com/search.json"
+
+# Tunables
 IMMERSIVE_CACHE_TTL = 300  # seconds
 if 'immersive_cache' not in st.session_state:
     st.session_state.immersive_cache = {}
 RESULTS_TO_DISPLAY = 4
 RESULTS_MIN_DISPLAY = 4
-RESULTS_FETCH_MULTIPLIER = 6
+# increased multiplier to fetch more candidates for relaxation steps
+RESULTS_FETCH_MULTIPLIER = 10
 IMAGE_COLOR_CACHE_TTL = 900
 if 'image_color_cache' not in st.session_state:
     st.session_state.image_color_cache = {}
@@ -102,7 +105,14 @@ def prioritize_results(results, must_words, prefer_words):
         score = sum(1 for word in prefer_words if word in title)
         scored.append((score, item))
     if not scored:
-        return results if not must_words else []
+        # If no exact must-word matches, fall back to prefer-word sorting across all results
+        fallback_scored = []
+        for item in results:
+            title = (item.get("title") or "").lower()
+            score = sum(1 for word in prefer_words if word in title)
+            fallback_scored.append((score, item))
+        fallback_scored.sort(key=lambda x: x[0], reverse=True)
+        return [item for _, item in fallback_scored]
     scored.sort(key=lambda x: x[0], reverse=True)
     prioritized = [item for _, item in scored]
     if must_words:
@@ -193,18 +203,22 @@ def parse_price_text(price_text):
     except ValueError:
         return None
 
-def filter_by_color_and_price(results, payload, preset_colors=None):
+def filter_by_color_and_price(results, payload, preset_colors=None, strict_color=True, strict_budget=True):
+    """
+    strict_color=True: require color match (title or image)
+    strict_budget=True: require price <= budget if budget specified
+    If strict_color is False, color is used only to push items up in ranking (not strictly required)
+    """
     target_colors = preset_colors if preset_colors is not None else extract_target_colors(payload)
     normalized_colors = [normalize_color_token(c) for c in target_colors]
     normalized_colors = [c for c in normalized_colors if c]
     budget_limit = parse_budget_value(payload.get("budget"))
     if not normalized_colors and budget_limit is None:
         return results
-    
-    # Strict filtering: both color and budget must match if specified
+
     filtered = []
-    budget_only = []  # Items within budget but no color match (only if no color filter)
-    
+    budget_only = []  # items within budget but no color match
+
     for item in results:
         title = (item.get("title") or "").lower()
         raw = item.get("raw") or {}
@@ -212,75 +226,90 @@ def filter_by_color_and_price(results, payload, preset_colors=None):
         if price_val is None:
             price_val = parse_price_text(item.get("price_text"))
 
-        # STRICT BUDGET CHECK: if budget is specified, item MUST be within budget
-        if budget_limit is not None:
+        # budget check
+        if budget_limit is not None and strict_budget:
             if price_val is None:
-                # If price cannot be determined and budget is specified, skip item
+                # skip if strict budget required and price unknown
                 continue
             if price_val > budget_limit:
-                # Strict: skip items over budget
                 continue
 
-        # STRICT COLOR CHECK: if color is specified, item MUST match color
+        # color matching
         color_matches = False
         if normalized_colors:
-            # Check if any of the target colors appear in title (including variations)
+            # Check title first
             for color in normalized_colors:
-                # Direct match
                 if color in title:
                     color_matches = True
                     break
-                # Check for color variations
+                # common variants
                 if color == "blue":
-                    blue_variants = ["blue", "navy", "powder blue", "royal blue", "sky blue", "teal", "turquoise", "azure"]
-                    if any(variant in title for variant in blue_variants):
+                    variants = ["blue", "navy", "powder blue", "royal blue", "sky blue", "teal", "turquoise", "azure"]
+                    if any(v in title for v in variants):
                         color_matches = True
                         break
                 elif color == "black":
-                    black_variants = ["black", "ebony", "charcoal", "onyx", "jet black"]
-                    if any(variant in title for variant in black_variants):
+                    variants = ["black", "ebony", "charcoal", "onyx", "jet black"]
+                    if any(v in title for v in variants):
                         color_matches = True
                         break
                 elif color == "white":
-                    white_variants = ["white", "ivory", "cream", "pearl", "snow"]
-                    if any(variant in title for variant in white_variants):
+                    variants = ["white", "ivory", "cream", "pearl", "snow"]
+                    if any(v in title for v in variants):
                         color_matches = True
                         break
                 elif color == "red":
-                    red_variants = ["red", "crimson", "scarlet", "burgundy", "maroon", "cherry"]
-                    if any(variant in title for variant in red_variants):
+                    variants = ["red", "crimson", "scarlet", "burgundy", "maroon", "cherry"]
+                    if any(v in title for v in variants):
                         color_matches = True
                         break
                 elif color == "green":
-                    green_variants = ["green", "emerald", "olive", "mint", "forest"]
-                    if any(variant in title for variant in green_variants):
+                    variants = ["green", "emerald", "olive", "mint", "forest"]
+                    if any(v in title for v in variants):
                         color_matches = True
                         break
-            # If not in title, check image
+            # If not matched in title, try image color
             if not color_matches:
                 color_matches = image_matches_color(item, normalized_colors)
-            
-            # Only include if color matches
+
             if color_matches:
                 filtered.append(item)
-        else:
-            # No color filter, but budget filter might be active
-            if budget_limit is not None:
-                # Item passed budget check, include it
-                budget_only.append(item)
             else:
-                # No filters at all
+                # keep for possible relaxed return (if strict_color False we'll include later)
+                budget_only.append(item)
+        else:
+            # No color filter specified
+            if budget_limit is not None and strict_budget:
+                # include if within budget
+                if price_val is None:
+                    continue
+                if price_val <= budget_limit:
+                    filtered.append(item)
+            else:
                 filtered.append(item)
 
-    # Return results - strict matching only
     if normalized_colors:
-        # If color filter is active, ONLY return color-matched items (which are also within budget if budget specified)
-        return filtered
-    elif budget_limit is not None:
-        # Only budget filter - return items within budget
-        return budget_only
+        if strict_color:
+            return filtered
+        else:
+            # relaxed: return color-matches first, then budget-only, then the rest
+            # dedupe while preserving order
+            merged = []
+            seen_links = set()
+            def add_list(lst):
+                for it in lst:
+                    key = it.get("link") or it.get("title") or str(id(it))
+                    if key not in seen_links:
+                        seen_links.add(key)
+                        merged.append(it)
+            add_list(filtered)
+            add_list(budget_only)
+            # finally add all original results as last resort
+            add_list(results)
+            return merged
     else:
-        # No filters
+        if budget_limit is not None:
+            return filtered
         return results
 
 def image_matches_color(item, colors):
@@ -445,7 +474,7 @@ def serpapi_search_shopping(query, num_results=6, country="in", language="en", m
     last_exc = None
     for attempt in range(1, max_retries + 1):
         try:
-            print(f"[serpapi] attempt {attempt} -> query: {query!r}")
+            print(f"[serpapi] attempt {attempt} -> query: {query!r} params={extra_params}")
             resp = requests.get(SERPAPI_URL, params=params, timeout=12)
             status = resp.status_code
             content_type = resp.headers.get("content-type", "")
@@ -515,75 +544,97 @@ def cached_direct_store_url(token, language="en", country="in"):
     return None
 
 def get_recommendations(data):
+    """
+    Progressive search logic:
+    1) Build query and try a strict search (color tbs, strict filtering)
+    2) If results < min, do a broader search without tbs (relaxed color)
+    3) If still < min, try color-augmented queries and prefer-word based fetch
+    4) Final: relaxed filtering (color optional) and return top RESULTS_TO_DISPLAY
+    """
     query = build_query(data)
     print("DEBUG QUERY ===>", query)
     if not query or not str(query).strip():
         return {"error": "Empty search query built from input"}, None
+
     target_colors = extract_target_colors(data)
-    extra_params = {}
+    must_words, prefer_words = keyword_constraints(data)
+
+    # Try param with color tbs (if available)
     color_filter_param = build_color_filter_param(target_colors)
+    extra_params = {}
     if color_filter_param:
         extra_params["tbs"] = color_filter_param
     if not extra_params:
         extra_params = None
+
+    # fetch a lot of candidates for ranking & relaxation
+    fetch_count = RESULTS_TO_DISPLAY * RESULTS_FETCH_MULTIPLIER
+
+    # 1) Primary: strict search (if color/budget specified)
     try:
-        fetch_count = RESULTS_TO_DISPLAY * RESULTS_FETCH_MULTIPLIER
-        results, raw = serpapi_search_shopping(query, num_results=fetch_count, extra_params=extra_params)
+        results_primary, raw_primary = serpapi_search_shopping(query, num_results=fetch_count, extra_params=extra_params)
     except requests.HTTPError as e:
         return {"error": "SerpAPI HTTP error", "details": str(e), "query": query}, None
     except Exception as e:
         print("FULL ERROR:", repr(e))
         return {"error": "SerpAPI request failed", "details": repr(e), "query": query}, None
-    all_results = list(results)
+
+    all_results = list(results_primary)
+    # check color hits - if too few, we'll broaden in steps
     color_hits = count_color_matches(all_results, target_colors)
+
+    # If color requested but few color hits, do an augmented fetch (color as prefix to query)
     if target_colors and color_hits < RESULTS_MIN_DISPLAY:
         augmented_query = f"{' '.join(target_colors)} {query}".strip()
         try:
-            extra_results, _ = serpapi_search_shopping(
-                augmented_query,
-                num_results=fetch_count,
-                extra_params=extra_params,
-            )
+            extra_results, _ = serpapi_search_shopping(augmented_query, num_results=fetch_count, extra_params=extra_params)
             all_results = merge_unique_results(all_results, extra_results)
         except Exception as exc:
             print(f"[recommend] color-augmented fetch failed: {exc}")
-    must_words, prefer_words = keyword_constraints(data)
+
+    # If still not enough, try without tbs (remove color param) to widen
+    if target_colors and color_hits < RESULTS_MIN_DISPLAY:
+        try:
+            extra_results_no_tbs, _ = serpapi_search_shopping(query, num_results=fetch_count, extra_params=None)
+            all_results = merge_unique_results(all_results, extra_results_no_tbs)
+        except Exception as exc:
+            print(f"[recommend] fetch without tbs failed: {exc}")
+
+    # Also try queries built from must/prefer words (two variants)
+    if must_words or prefer_words:
+        q1 = " ".join(must_words + prefer_words + [query])
+        try:
+            qr1_results, _ = serpapi_search_shopping(q1, num_results=fetch_count // 2, extra_params=None)
+            all_results = merge_unique_results(all_results, qr1_results)
+        except Exception as exc:
+            print(f"[recommend] must/prefer augmented fetch failed: {exc}")
+
+    # priorize using keyword constraints
     keyword_results = prioritize_results(all_results, must_words, prefer_words)
-    filtered_results = filter_by_color_and_price(keyword_results, data, preset_colors=target_colors)
-    if len(filtered_results) < RESULTS_MIN_DISPLAY and target_colors:
-        category = data.get("category", "").strip()
-        items = data.get("items", "").strip()
-        if category or items:
-            alt_queries = []
-            if category:
-                alt_queries.append(f"{' '.join(target_colors)} {category}")
-            if items:
-                item_tokens = items.split()
-                color_tokens = [t for t in item_tokens if t.lower() not in target_colors]
-                if color_tokens:
-                    alt_queries.append(f"{' '.join(target_colors)} {' '.join(color_tokens)}")
-            for alt_q in alt_queries[:2]:
-                try:
-                    alt_results, _ = serpapi_search_shopping(
-                        alt_q,
-                        num_results=fetch_count // 2,
-                        extra_params=extra_params,
-                    )
-                    all_results = merge_unique_results(all_results, alt_results)
-                    keyword_results = prioritize_results(all_results, must_words, prefer_words)
-                    filtered_results = filter_by_color_and_price(keyword_results, data, preset_colors=target_colors)
-                    if len(filtered_results) >= RESULTS_MIN_DISPLAY:
-                        break
-                except Exception as exc:
-                    print(f"[recommend] alt query '{alt_q}' failed: {exc}")
-    final_results = filtered_results[:RESULTS_TO_DISPLAY]
-    # DO NOT add items back that don't match filters - strict filtering only
-    # If we have fewer results, that's okay - better than showing wrong items
-    return {
-        "query": query,
-        "count": len(final_results),
-        "results": final_results,
-    }, raw
+
+    # 2) Strict filter first (color + budget enforced)
+    filtered_strict = filter_by_color_and_price(keyword_results, data, preset_colors=target_colors, strict_color=True, strict_budget=True)
+
+    # If strict gives enough:
+    if len(filtered_strict) >= RESULTS_MIN_DISPLAY:
+        final = filtered_strict[:RESULTS_TO_DISPLAY]
+        return {"query": query, "count": len(final), "results": final}, raw_primary
+
+    # 3) Relax budget strictness if budget is provided (allow unknown-priced items)
+    filtered_budget_relaxed = filter_by_color_and_price(keyword_results, data, preset_colors=target_colors, strict_color=True, strict_budget=False)
+    if len(filtered_budget_relaxed) >= RESULTS_MIN_DISPLAY:
+        final = filtered_budget_relaxed[:RESULTS_TO_DISPLAY]
+        return {"query": query, "count": len(final), "results": final}, raw_primary
+
+    # 4) Relax color requirement (color becomes preference not requirement)
+    filtered_color_relaxed = filter_by_color_and_price(keyword_results, data, preset_colors=target_colors, strict_color=False, strict_budget=False)
+    if len(filtered_color_relaxed) >= RESULTS_MIN_DISPLAY:
+        final = filtered_color_relaxed[:RESULTS_TO_DISPLAY]
+        return {"query": query, "count": len(final), "results": final}, raw_primary
+
+    # 5) As a last resort, return top RESULTS_TO_DISPLAY from prioritized results (may not match color/budget)
+    final = keyword_results[:RESULTS_TO_DISPLAY]
+    return {"query": query, "count": len(final), "results": final}, raw_primary
 
 # Streamlit UI
 st.set_page_config(page_title="Fashion Recommender", page_icon="👕", layout="wide")
@@ -629,7 +680,7 @@ else:
         )
         color = st.selectbox(
             "Color (optional - filters results by color)",
-            options=["", "black", "white", "blue", "navy", "red", "pink", "green", "yellow", 
+            options=["", "black", "white", "blue", "navy", "red", "pink", "green", "yellow",
                     "orange", "brown", "purple", "gray", "grey", "beige", "maroon", "teal"],
             index=0
         )
@@ -656,7 +707,7 @@ else:
         items_with_color = items
         if color:
             items_with_color = f"{color} {items}".strip() if items else color
-        
+
         payload = {
             "category_key": category_key,
             "category": category,
@@ -668,7 +719,7 @@ else:
         }
         with st.spinner("Searching..."):
             result, raw = get_recommendations(payload)
-        
+
         if "error" in result:
             st.error(f"Error: {result.get('error')} - {result.get('details', '')}")
         else:
@@ -680,13 +731,13 @@ else:
                 filter_info.append(f"Color: {', '.join(target_colors)}")
             if budget_limit:
                 filter_info.append(f"Budget: ₹{budget_limit}")
-            
+
             filter_text = f" | Filters: {', '.join(filter_info)}" if filter_info else ""
             if result['count'] == RESULTS_TO_DISPLAY:
                 st.success(f"Found {result['count']} perfect recommendations for: \"{result['query']}\"{filter_text}")
             else:
-                st.success(f"Found {result['count']} perfect recommendations for: \"{result['query']}\"{filter_text}")
-            
+                st.success(f"Found {result['count']} recommendations for: \"{result['query']}\"{filter_text}")
+
             if result['count'] == 0:
                 warning_msg = "No recommendations found"
                 if target_colors and budget_limit:
@@ -708,22 +759,22 @@ else:
                             st.write(f"**{item.get('title', 'N/A')}**")
                             st.write(f"**Price:** {item.get('price_text', 'N/A')}")
                             st.write(f"**Source:** {item.get('source', 'N/A')}")
-                            
+
                             # Store product data for detail view
                             product_key = f"product_{idx}"
                             st.session_state[product_key] = item
-                            
+                            st.session_state['current_product'] = item
+
                             # Create button to view product
                             token = item.get('immersive_token', '')
                             merchant_link = item.get('merchant_link', '')
                             link = item.get('link', '')
                             direct_link = cached_direct_store_url(token) if token else None
                             buy_url = direct_link or merchant_link or link
-                            
+
                             if buy_url:
                                 st.markdown(
                                     f'<a href="{buy_url}" target="_blank" style="display:inline-block;margin-top:8px;padding:8px 10px;border-radius:6px;background:#0ea5e9;color:white;text-decoration:none;cursor:pointer;">View / Buy (open product page)</a>',
                                     unsafe_allow_html=True
                                 )
                             st.divider()
-
