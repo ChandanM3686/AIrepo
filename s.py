@@ -200,9 +200,11 @@ def filter_by_color_and_price(results, payload, preset_colors=None):
     budget_limit = parse_budget_value(payload.get("budget"))
     if not normalized_colors and budget_limit is None:
         return results
+    
+    # Strict filtering: both color and budget must match if specified
     filtered = []
-    relaxed = []
-    color_only = []
+    budget_only = []  # Items within budget but no color match (only if no color filter)
+    
     for item in results:
         title = (item.get("title") or "").lower()
         raw = item.get("raw") or {}
@@ -210,37 +212,56 @@ def filter_by_color_and_price(results, payload, preset_colors=None):
         if price_val is None:
             price_val = parse_price_text(item.get("price_text"))
 
-        color_score = 0
+        # STRICT BUDGET CHECK: if budget is specified, item MUST be within budget
+        if budget_limit is not None:
+            if price_val is None:
+                # If price cannot be determined and budget is specified, skip item
+                continue
+            if price_val > budget_limit:
+                # Strict: skip items over budget
+                continue
+
+        # STRICT COLOR CHECK: if color is specified, item MUST match color
+        color_matches = False
         if normalized_colors:
+            # Check if any of the target colors appear in title (including variations)
             for color in normalized_colors:
+                # Direct match
                 if color in title:
-                    color_score += 1
-            if color_score == 0 and normalized_colors:
-                if image_matches_color(item, normalized_colors):
-                    color_score = 1
-        price_ok = True
-        if budget_limit is not None and price_val is not None:
-            price_ok = price_val <= budget_limit
+                    color_matches = True
+                    break
+                # Check for color variations (e.g., "powder blue", "royal blue", "navy blue" for "blue")
+                if color == "blue":
+                    blue_variants = ["blue", "navy", "powder blue", "royal blue", "sky blue", "teal", "turquoise"]
+                    if any(variant in title for variant in blue_variants):
+                        color_matches = True
+                        break
+            # If not in title, check image
+            if not color_matches:
+                color_matches = image_matches_color(item, normalized_colors)
+            
+            # Only include if color matches
+            if color_matches:
+                filtered.append(item)
+        else:
+            # No color filter, but budget filter might be active
+            if budget_limit is not None:
+                # Item passed budget check, include it
+                budget_only.append(item)
+            else:
+                # No filters at all
+                filtered.append(item)
 
-        if color_score == len(normalized_colors or [1]) and price_ok:
-            filtered.append((color_score, item))
-        elif color_score > 0 and price_ok:
-            relaxed.append((color_score, item))
-        elif color_score == len(normalized_colors or [1]) and budget_limit is not None:
-            color_only.append((color_score, item))
-
-    if filtered:
-        filtered.sort(key=lambda x: x[0], reverse=True)
-        return [item for _, item in filtered]
-    if relaxed:
-        relaxed.sort(key=lambda x: x[0], reverse=True)
-        return [item for _, item in relaxed]
-    if color_only:
-        color_only.sort(key=lambda x: x[0], reverse=True)
-        return [item for _, item in color_only]
+    # Return results - strict matching only
     if normalized_colors:
+        # If color filter is active, ONLY return color-matched items (which are also within budget if budget specified)
+        return filtered
+    elif budget_limit is not None:
+        # Only budget filter - return items within budget
+        return budget_only
+    else:
+        # No filters
         return results
-    return results
 
 def image_matches_color(item, colors):
     if not colors:
@@ -536,14 +557,8 @@ def get_recommendations(data):
                 except Exception as exc:
                     print(f"[recommend] alt query '{alt_q}' failed: {exc}")
     final_results = filtered_results[:RESULTS_TO_DISPLAY]
-    if len(final_results) < RESULTS_MIN_DISPLAY and len(keyword_results) > len(final_results):
-        seen = {id(item) for item in final_results}
-        for item in keyword_results:
-            if id(item) not in seen:
-                final_results.append(item)
-                seen.add(id(item))
-            if len(final_results) >= RESULTS_MIN_DISPLAY:
-                break
+    # DO NOT add items back that don't match filters - strict filtering only
+    # If we have fewer results, that's okay - better than showing wrong items
     return {
         "query": query,
         "count": len(final_results),
@@ -637,18 +652,27 @@ else:
         if "error" in result:
             st.error(f"Error: {result.get('error')} - {result.get('details', '')}")
         else:
-            # Show color filter status if active
+            # Show filter status if active
             target_colors = extract_target_colors(payload)
-            color_info = ""
+            budget_limit = parse_budget_value(payload.get("budget"))
+            filter_info = []
             if target_colors:
-                color_info = f" | Filtering by color: {', '.join(target_colors)}"
-            st.success(f"Found {result['count']} items for: \"{result['query']}\"{color_info}")
+                filter_info.append(f"Color: {', '.join(target_colors)}")
+            if budget_limit:
+                filter_info.append(f"Budget: ₹{budget_limit}")
+            
+            filter_text = f" | Filters: {', '.join(filter_info)}" if filter_info else ""
+            st.success(f"Found {result['count']} items for: \"{result['query']}\"{filter_text}")
             
             if result['count'] == 0:
-                if target_colors:
-                    st.warning(f"No recommendations found matching color: {', '.join(target_colors)}. Try adjusting your search criteria.")
-                else:
-                    st.info("No recommendations found.")
+                warning_msg = "No recommendations found"
+                if target_colors and budget_limit:
+                    warning_msg = f"No recommendations found matching color: {', '.join(target_colors)} and budget: ₹{budget_limit}. Try adjusting your search criteria."
+                elif target_colors:
+                    warning_msg = f"No recommendations found matching color: {', '.join(target_colors)}. Try adjusting your search criteria."
+                elif budget_limit:
+                    warning_msg = f"No recommendations found within budget: ₹{budget_limit}. Try increasing your budget or adjusting your search criteria."
+                st.warning(warning_msg)
             else:
                 # Display results in a grid
                 cols = st.columns(3)
