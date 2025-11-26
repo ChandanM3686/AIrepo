@@ -19,8 +19,8 @@ SERPAPI_URL = "https://serpapi.com/search.json"
 IMMERSIVE_CACHE_TTL = 300  # seconds
 if 'immersive_cache' not in st.session_state:
     st.session_state.immersive_cache = {}
-RESULTS_TO_DISPLAY = 6
-RESULTS_MIN_DISPLAY = 5
+RESULTS_TO_DISPLAY = 4
+RESULTS_MIN_DISPLAY = 4
 RESULTS_FETCH_MULTIPLIER = 6
 IMAGE_COLOR_CACHE_TTL = 900
 if 'image_color_cache' not in st.session_state:
@@ -230,10 +230,30 @@ def filter_by_color_and_price(results, payload, preset_colors=None):
                 if color in title:
                     color_matches = True
                     break
-                # Check for color variations (e.g., "powder blue", "royal blue", "navy blue" for "blue")
+                # Check for color variations
                 if color == "blue":
-                    blue_variants = ["blue", "navy", "powder blue", "royal blue", "sky blue", "teal", "turquoise"]
+                    blue_variants = ["blue", "navy", "powder blue", "royal blue", "sky blue", "teal", "turquoise", "azure"]
                     if any(variant in title for variant in blue_variants):
+                        color_matches = True
+                        break
+                elif color == "black":
+                    black_variants = ["black", "ebony", "charcoal", "onyx", "jet black"]
+                    if any(variant in title for variant in black_variants):
+                        color_matches = True
+                        break
+                elif color == "white":
+                    white_variants = ["white", "ivory", "cream", "pearl", "snow"]
+                    if any(variant in title for variant in white_variants):
+                        color_matches = True
+                        break
+                elif color == "red":
+                    red_variants = ["red", "crimson", "scarlet", "burgundy", "maroon", "cherry"]
+                    if any(variant in title for variant in red_variants):
+                        color_matches = True
+                        break
+                elif color == "green":
+                    green_variants = ["green", "emerald", "olive", "mint", "forest"]
+                    if any(variant in title for variant in green_variants):
                         color_matches = True
                         break
             # If not in title, check image
@@ -662,7 +682,10 @@ else:
                 filter_info.append(f"Budget: ₹{budget_limit}")
             
             filter_text = f" | Filters: {', '.join(filter_info)}" if filter_info else ""
-            st.success(f"Found {result['count']} items for: \"{result['query']}\"{filter_text}")
+            if result['count'] == RESULTS_TO_DISPLAY:
+                st.success(f"Found {result['count']} perfect recommendations for: \"{result['query']}\"{filter_text}")
+            else:
+                st.success(f"Found {result['count']} perfect recommendations for: \"{result['query']}\"{filter_text}")
             
             if result['count'] == 0:
                 warning_msg = "No recommendations found"
@@ -674,10 +697,10 @@ else:
                     warning_msg = f"No recommendations found within budget: ₹{budget_limit}. Try increasing your budget or adjusting your search criteria."
                 st.warning(warning_msg)
             else:
-                # Display results in a grid
-                cols = st.columns(3)
+                # Display results in a 2x2 grid (2 columns for 4 items)
+                cols = st.columns(2)
                 for idx, item in enumerate(result['results']):
-                    col_idx = idx % 3
+                    col_idx = idx % 2
                     with cols[col_idx]:
                         with st.container():
                             if item.get('thumbnail'):
